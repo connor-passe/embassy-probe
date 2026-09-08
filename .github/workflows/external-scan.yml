@@ -121,8 +121,6 @@ jobs:
       # added by this task: none.
       - name: Publish the signed result to the scan-results branch
         run: |
-          git config user.name "external-scan[bot]"
-          git config user.email "external-scan@users.noreply.github.com"
           rm -rf "$RUNNER_TEMP/publish"
           mkdir -p "$RUNNER_TEMP/publish"
           cd "$RUNNER_TEMP/publish"
@@ -131,6 +129,15 @@ jobs:
           # a compromise of its contents cannot become code execution anywhere —
           # the Pi already treats every byte of it as untrusted input.
           git init --quiet -b scan-results .
+          # The identity MUST be configured AFTER this `git init`, not before it.
+          # It used to be set at the top of this step, which is a different
+          # repository — the checked-out workspace — so this fresh one inherited
+          # nothing and `git commit` died with "empty ident name", exit 128.
+          # Nothing could catch that until the workflow ran for the first time,
+          # and it never had: Actions were dark for billing from the day this was
+          # written until 2026-09-08.
+          git config user.name "external-scan[bot]"
+          git config user.email "external-scan@users.noreply.github.com"
           git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
           cp "$RUNNER_TEMP/latest.json" latest.json
           mkdir -p runs
