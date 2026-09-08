@@ -1,0 +1,155 @@
+# T027 — the external exposure scan.
+#
+# This is its OWN workflow file. `ci.yml` is T001's and is not edited by this
+# task; `git diff origin/main -- .github/workflows/` shows only this file.
+#
+# WHAT IT ANSWERS
+# ---------------
+# Every device in this house has a globally routable IPv6 address with services
+# bound to it — Samba on smart-wall-pi among them — and inbound filtering was
+# never verified. Nothing inside the house can verify it: a scan from inside
+# answers a different question. So the scan runs here, from genuinely outside,
+# and the result comes back over an outbound poll (see the transport note below).
+#
+# WHY THIS WORKFLOW REFERENCES NO ACTION AT ALL
+# ---------------------------------------------
+# T027 requires every action to be pinned by commit SHA rather than by tag,
+# because a tag can be moved under you. This workflow goes one step further and
+# uses NO third-party or first-party action at all: the checkout is six lines of
+# `git`. This is the one workflow in the repository that holds the house's WAN
+# addresses and the ingest signing key in its environment, and the smallest
+# possible supply chain is the point. A SHA pin you cannot verify offline is a
+# pin you are trusting on faith; no dependency needs no faith.
+#
+# WHY `pull_request` IS ABSENT
+# -----------------------------
+# A fork PR must not be able to reach these secrets, and a scan triggered by an
+# outsider is an outsider's scan. `schedule` and `workflow_dispatch` only — and
+# `exposure/provenance.py` on the Pi REJECTS any result whose run reports any
+# other triggering event, so this is enforced twice.
+#
+# REQUIRED REPOSITORY SECRETS — created by Connor, never by an agent
+# -------------------------------------------------------------------
+#   WAN_IPV4            the house WAN IPv4 address
+#   WAN_IPV6_TARGETS    newline- or comma-separated list of the specific IPv6
+#                       GUAs to scan (a /64 cannot be brute-forced, so an
+#                       explicit list is the only workable approach)
+#   SCAN_INGEST_TOKEN   the shared secret, identical to the contents of
+#                       /etc/embassy-secdash/ingest.token.external-scan
+#
+# `.github/scripts/external_scan.py` fails the job loudly and early if any of the
+# three is absent. There is no placeholder and no default. The exact creation
+# steps are in docs/artifacts/T027-transport-decision.md.
+
+name: external-scan
+
+on:
+  schedule:
+    # Every four hours, offset off the hour so it does not land in the crowd of
+    # jobs the whole world schedules at :00.
+    - cron: "17 */4 * * *"
+  workflow_dispatch:
+
+# `contents: write` is needed for exactly one thing: pushing the signed result to
+# the `scan-results` branch. Branch protection on `main` (required by T027
+# acceptance criterion 16) is what stops this permission being useful anywhere
+# else, and it is a REQUIRED setting, not a nice-to-have.
+permissions:
+  contents: write
+
+concurrency:
+  group: external-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Refuse to run without the three secrets
+        env:
+          WAN_IPV4: ${{ secrets.WAN_IPV4 }}
+          WAN_IPV6_TARGETS: ${{ secrets.WAN_IPV6_TARGETS }}
+          SCAN_INGEST_TOKEN: ${{ secrets.SCAN_INGEST_TOKEN }}
+        run: |
+          missing=""
+          [ -n "$WAN_IPV4" ] || missing="$missing WAN_IPV4"
+          [ -n "$WAN_IPV6_TARGETS" ] || missing="$missing WAN_IPV6_TARGETS"
+          [ -n "$SCAN_INGEST_TOKEN" ] || missing="$missing SCAN_INGEST_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "::error::missing repository secret(s):$missing — see docs/artifacts/T027-transport-decision.md"
+            exit 1
+          fi
+          echo "all three secrets are present (values not printed, by design)"
+
+      - name: Check out this commit without a third-party action
+        run: |
+          git init --quiet .
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git -c protocol.version=2 fetch --quiet --depth=1 origin "${{ github.sha }}"
+          git checkout --quiet FETCH_HEAD
+          test -f .github/scripts/external_scan.py
+
+      - name: Install nmap
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends nmap
+          nmap --version | head -1
+
+      # The scan, the positive control, the redaction and the signature all
+      # happen inside one script so that no intermediate file holding an
+      # un-redacted address is ever written to the workspace.
+      #
+      # THE CONTROL IS NOT OPTIONAL GARNISH. `scanme.nmap.org` is scanned in this
+      # same step, over the same egress, with the same binary, and its open-port
+      # count is recorded in the signed body. A result whose control saw nothing
+      # is recorded by the Pi as ok=0 with a named reason and commits NO filtered
+      # state — because an ISP that blocks scanning from datacentre ranges
+      # produces a perfect imitation of a well-firewalled house.
+      - name: Scan, control, redact, sign
+        env:
+          WAN_IPV4: ${{ secrets.WAN_IPV4 }}
+          WAN_IPV6_TARGETS: ${{ secrets.WAN_IPV6_TARGETS }}
+          SCAN_INGEST_TOKEN: ${{ secrets.SCAN_INGEST_TOKEN }}
+        run: python3 .github/scripts/external_scan.py "$RUNNER_TEMP/latest.json"
+
+      # The shipped transport (T027 Approach section 2, option A — PULL).
+      #
+      # The dashboard is tailnet-only and adding inbound exposure to it is
+      # Connor's decision, not this workflow's. So the result is published HERE
+      # and the Pi polls outbound for it every five minutes. Inbound exposure
+      # added by this task: none.
+      - name: Publish the signed result to the scan-results branch
+        run: |
+          git config user.name "external-scan[bot]"
+          git config user.email "external-scan@users.noreply.github.com"
+          rm -rf "$RUNNER_TEMP/publish"
+          mkdir -p "$RUNNER_TEMP/publish"
+          cd "$RUNNER_TEMP/publish"
+          # A fresh `git init` has no history, so this branch is an ORPHAN by
+          # construction. It shares nothing with `main` and carries no source, so
+          # a compromise of its contents cannot become code execution anywhere —
+          # the Pi already treats every byte of it as untrusted input.
+          git init --quiet -b scan-results .
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          cp "$RUNNER_TEMP/latest.json" latest.json
+          mkdir -p runs
+          cp "$RUNNER_TEMP/latest.json" "runs/${GITHUB_RUN_ID}.json"
+          git add latest.json "runs/${GITHUB_RUN_ID}.json"
+          git commit --quiet -m "external-scan: run ${GITHUB_RUN_ID}"
+          # Force-push is correct HERE and only here: the branch is a published
+          # mailbox, not history. It is never `main`, and the Pi's replay ledger
+          # plus the HMAC are what give the contents their integrity.
+          git push --quiet --force origin scan-results
+
+      # ---------------------------------------------------------------------
+      # T072 SEAM — DO NOT IMPLEMENT IN THIS TASK.
+      #
+      # T072 owns the dead-man's-switch that checks R2 replica freshness, and it
+      # brings its own read-only R2 repository secret. It goes here, as its own
+      # job in this file or its own workflow, at T072's discretion.
+      #
+      # NO R2 CREDENTIAL IS ADDED HERE. This is deliberately the workflow with
+      # the smallest secret set in the repository, because it is the one built
+      # around a transport that faces outward.
+      # ---------------------------------------------------------------------
