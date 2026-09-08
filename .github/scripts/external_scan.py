@@ -216,7 +216,15 @@ def main() -> int:
 
     wan_v4 = os.environ["WAN_IPV4"].strip()
     v6_targets = split_targets(os.environ["WAN_IPV6_TARGETS"])
-    key = os.environ["SCAN_INGEST_TOKEN"]
+    # `.strip()` deliberately, and it is not cosmetic. The Pi reads the same
+    # shared secret from /etc/embassy-secdash/ingest.token.external-scan with
+    # `.read_text().strip()`, and that file ends with a newline like every file
+    # written by a text editor. Without the strip here the runner HMACs 65 bytes
+    # while the Pi verifies 64, every signature mismatches, and the result is
+    # rejected as forged — a total, silent failure that looks exactly like an
+    # attacker minting results. `wan_v4` on the line above was already stripped;
+    # the key was not.
+    key = os.environ["SCAN_INGEST_TOKEN"].strip()
     if not v6_targets:
         die("WAN_IPV6_TARGETS is set but empty after parsing; nothing to scan")
 
