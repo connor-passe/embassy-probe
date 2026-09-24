@@ -39,7 +39,8 @@
 #
 # `.github/scripts/external_scan.py` fails the job loudly and early if any of the
 # three is absent. There is no placeholder and no default. The exact creation
-# steps are in docs/artifacts/T027-transport-decision.md.
+# steps are in docs/artifacts/T027/connor-setup-steps.md (t111), which
+# supersedes the older ones in docs/artifacts/T027-transport-decision.md.
 
 name: external-scan
 
@@ -63,6 +64,14 @@ concurrency:
 
 jobs:
   scan:
+    # THE SCAN RUNS IN THE PUBLIC PROBE REPOSITORY, NOT HERE (t111).
+    # This file is copied verbatim into connor-passe/embassy-probe, which holds
+    # the three secrets and has published a result on schedule since 2026-09-08
+    # (docs/artifacts/T027-scan-vantage.md). In THIS repository the same cron
+    # produced a failed run every four hours for a job that can never run here —
+    # no secrets, by design — and that red history is what made the scan look
+    # like it "has never run". Skipped here, unchanged there.
+    if: github.repository == 'connor-passe/embassy-probe'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:

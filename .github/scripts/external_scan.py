@@ -238,9 +238,15 @@ def main() -> int:
     # --- the positive control, FIRST, over the same egress ---------------
     control = {"4": control_block(4, [], hashes), "6": control_block(6, ["-6"], hashes)}
 
-    # --- IPv4: SYN scan of the top 1000, open ports only -----------------
+    # --- IPv4: SYN scan of the top 1000 ---------------------------------
+    # NOT `--open` (t111). With `--open` and nothing open, nmap omits the <host>
+    # element ENTIRELY: no <extraports>, no count, no state. Every result from
+    # 2026-09-08 to 2026-09-24 was recorded "0 open of 0 probed", and a port that
+    # closed could only vanish, never be seen closing. Without the flag nmap
+    # still collapses the unanswered ports into <extraports>, so the XML stays a
+    # few kilobytes.
     v4_xml, v4_error = run_nmap(
-        ["sudo", "nmap", "-Pn", "-sS", "--top-ports", "1000", "--open", wan_v4], hashes
+        ["sudo", "nmap", "-Pn", "-sS", "--top-ports", "1000", wan_v4], hashes
     )
     if v4_error is not None:
         print(f"::warning::IPv4 scan failed: {v4_error}")
