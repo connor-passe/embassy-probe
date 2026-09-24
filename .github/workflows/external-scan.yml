@@ -36,6 +36,11 @@
 #                       explicit list is the only workable approach)
 #   SCAN_INGEST_TOKEN   the shared secret, identical to the contents of
 #                       /etc/embassy-secdash/ingest.token.external-scan
+#                       Since t120 it also KEYS the published target
+#                       fingerprint: this repository is public, and an
+#                       unkeyed sha256 of an IPv4 address is reversed in
+#                       minutes. Nothing derived from WAN_* without it is
+#                       ever written to the result or to this log.
 #
 # `.github/scripts/external_scan.py` fails the job loudly and early if any of the
 # three is absent. There is no placeholder and no default. The exact creation

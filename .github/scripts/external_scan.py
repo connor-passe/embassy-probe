@@ -16,10 +16,16 @@ THE THREE THINGS THIS SCRIPT MUST GET RIGHT
    `scanme.nmap.org` — sanctioned by the Nmap project for exactly this, and the
    only third-party host this task may touch. Its open-port count is what makes a
    "filtered" verdict mean anything, and it is recorded per run.
-2. **No address leaves this job.** Every occurrence of every `WAN_*` secret is
-   replaced with its sha256 hex before anything is written, and the result is
-   then RE-CHECKED for the literal. A hit aborts the run. GitHub masks secrets in
-   logs, but masking is a backstop, not a design.
+2. **No address leaves this job — not even reversibly.** This job runs in a
+   PUBLIC repository; its result and its log are world-readable. Every target is
+   named by its KEYED fingerprint (`target_fingerprint`, t120), never by
+   `sha256(address)`: the IPv4 space is 2^32 values and an unkeyed digest of one
+   is reversed in minutes. nmap is told not to reverse-resolve (`-n`), because an
+   ISP's PTR name spells the address out in digits, and `<hostnames>` is stripped
+   anyway. The finished body is then RE-CHECKED for anything that parses as an
+   address, for any `<hostname`, and for the unkeyed digest of every target. A
+   hit aborts the run. GitHub masks secret VALUES in logs, but nothing derived
+   from them, so masking is a backstop, not a design.
 3. **A failure is reported, never smoothed over.** No egress, no IPv6 route, a
    timeout, a missing secret — each produces an explicit error string in the
    control block, which the Pi turns into `ok=0` and a named reason. There is no
@@ -30,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -70,8 +77,122 @@ def die(message: str) -> None:
     sys.exit(1)
 
 
-def sha256_hex(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+#: t120. The construction below, by name. Published next to every fingerprint so
+#: the Pi can tell a pre-t120 `sha256(address)` (no field at all) from this, and
+#: compare each row with a gateway fingerprint of the same kind. A changed
+#: construction is a NEW string (`:v2`), never a silent edit to this one.
+TARGET_HASH_ALG = "hmac-sha256:v1"
+
+#: Domain separation. The same secret signs the result body; with this prefix no
+#: target fingerprint can coincide with a body signature, whatever either holds.
+TARGET_FP_DOMAIN = b"embassy-secdash/target/v1|"
+
+
+#: The key id's message: HMAC(key, this)[:16] names WHICH key made a fingerprint
+#: without saying anything about the key. A rotation of SCAN_INGEST_TOKEN changes
+#: it, so the Pi reads rows made under the old key as "cannot compare", not as a
+#: scan of somebody else.
+TARGET_KEY_ID_MESSAGE = b"embassy-secdash/key-id/v1"
+
+
+def target_key_id(key: str) -> str:
+    return hmac.new(key.strip().encode("utf-8"), TARGET_KEY_ID_MESSAGE, hashlib.sha256).hexdigest()[
+        :16
+    ]
+
+
+def canonical_target(value: str) -> str:
+    """One spelling per address, so a secret typed long-form, the compressed form
+    nmap prints, and the form the gateway reports all fingerprint alike.
+
+    Byte-identical to `embassy_secdash.exposure.fingerprint.canonical_target` —
+    pinned by `tests/unit/exposure/test_target_fingerprint.py`.
+    """
+    text = value.strip()
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return text
+
+
+def target_fingerprint(key: str, value: str) -> str:
+    """`HMAC-SHA256(key, TARGET_FP_DOMAIN + canonical(value))`, hex. t120.
+
+    Keyed with SCAN_INGEST_TOKEN, which the Pi holds as
+    `ingest.token.external-scan`: the Pi can recompute it from the gateway's
+    address; nobody reading this public repository can test a guess against it.
+    """
+    message = TARGET_FP_DOMAIN + canonical_target(value).encode("utf-8")
+    return hmac.new(key.strip().encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def _spellings(value: str) -> set[str]:
+    """Every textual form of one target that nmap or a human might produce."""
+    forms = {value, value.strip()}
+    try:
+        address = ipaddress.ip_address(value.strip())
+    except ValueError:
+        return forms
+    forms |= {str(address), address.exploded}
+    return forms
+
+
+def redaction_map(key: str, targets: list[str]) -> dict[str, str]:
+    """Every spelling of every target -> that target's keyed fingerprint."""
+    out: dict[str, str] = {}
+    for value in targets:
+        fingerprint = target_fingerprint(key, value)
+        for form in _spellings(value):
+            if form:
+                out[form] = fingerprint
+    return out
+
+
+_HOSTNAMES = re.compile(r"<hostnames\b[^>]*?(?:/>|>.*?</hostnames>)", re.DOTALL)
+_STRAY_HOSTNAME = re.compile(r"<hostname\b[^>]*/?>")
+
+
+def strip_hostnames(xml: str) -> str:
+    """Remove every `<hostnames>` block (and any stray `<hostname>`). t120.
+
+    The PTR name of a residential WAN address is the address in digits
+    (`c-203-0-113-47.<isp>.net`). `-n` stops nmap looking it up; this is the
+    backstop for the day an nmap or a flag change brings it back. The Pi's
+    parser reads no hostname, so nothing downstream loses anything.
+    """
+    return _STRAY_HOSTNAME.sub("", _HOSTNAMES.sub("", xml))
+
+
+#: Tokens that MIGHT be addresses; `ipaddress` decides. Clock times such as
+#: `16:17:05` match the IPv6 half and are correctly rejected by `ipaddress`.
+_MAYBE_V4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+_MAYBE_V6 = re.compile(r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}")
+
+
+def public_leaks(text: str, targets: list[str]) -> list[str]:
+    """Why `text` must not be published, by REASON only — never the value.
+
+    Deliberately blunt: ANY address, not only the house's. The published body
+    has no legitimate reason to carry one (the control is reported as counts),
+    and a check that only knows the house's spellings is the check that missed
+    the PTR name.
+    """
+    reasons: list[str] = []
+    for token in [*_MAYBE_V4.findall(text), *_MAYBE_V6.findall(text)]:
+        try:
+            ipaddress.ip_address(token)
+        except ValueError:
+            continue
+        reasons.append("an address-shaped value")
+        break
+    if "<hostname" in text:
+        reasons.append("a <hostname> element")
+    for value in targets:
+        for form in _spellings(value):
+            if form and hashlib.sha256(form.encode("utf-8")).hexdigest() in text:
+                reasons.append("an unkeyed sha256 of a target")
+                break
+    return reasons
 
 
 #: Anything shaped like an address, in ANY textual form nmap might choose. Applied
@@ -83,6 +204,7 @@ def sha256_hex(value: str) -> str:
 #: a control — it is one of two.
 _ADDR_SHAPED = re.compile(
     r"(?:(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?)"  # IPv4, optionally with a prefix length
+    r"|(?:\d{1,3}[-_]){3}\d{1,3}"  # an IPv4 spelled PTR-style: c-203-0-113-47.<isp>.net
     r"|(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?:/\d{1,3})?"  # IPv6, incl. `::` forms
 )
 
@@ -92,9 +214,11 @@ def scrub(text: str, secrets_to_hash: dict[str, str]) -> str:
 
     Two independent controls, in this order:
 
-    1. `redact()` — exact secret literals become their sha256, so a reader can
-       still correlate a message with the target it belongs to.
-    2. `_ADDR_SHAPED` — every remaining address-shaped token becomes `<addr>`.
+    1. `redact()` — every spelling of a target becomes its KEYED fingerprint, so
+       a reader can still correlate a message with the target it belongs to.
+       (Before t120 this was its sha256: on a public log, the address again.)
+    2. `_ADDR_SHAPED` — every remaining address-shaped token becomes `<addr>`,
+       including an IPv4 spelled with dashes the way a PTR name spells it.
 
     Step 2 exists because step 1 is not sufficient on its own. `WAN_IPV6_TARGETS`
     is a MULTI-LINE secret, and GitHub masks multi-line secrets by whole value,
@@ -157,7 +281,7 @@ def count_open(xml: str) -> int | None:
 
 
 def redact(text: str, secrets_to_hash: dict[str, str]) -> str:
-    """Substitute every secret literal for its hash, longest first.
+    """Substitute every target spelling for its keyed fingerprint, longest first.
 
     Longest first so that a `/64` prefix does not partially eat a full GUA and
     leave a recognisable tail behind.
@@ -228,9 +352,8 @@ def main() -> int:
     if not v6_targets:
         die("WAN_IPV6_TARGETS is set but empty after parsing; nothing to scan")
 
-    hashes = {wan_v4: sha256_hex(wan_v4)}
-    for target in v6_targets:
-        hashes[target] = sha256_hex(target)
+    all_targets = [wan_v4, *v6_targets]
+    hashes = redaction_map(key, all_targets)
 
     scan_ts = int(time.time())
     targets: list[dict[str, object]] = []
@@ -245,8 +368,11 @@ def main() -> int:
     # closed could only vanish, never be seen closing. Without the flag nmap
     # still collapses the unanswered ports into <extraports>, so the XML stays a
     # few kilobytes.
+    #
+    # `-n` (t120): no reverse DNS. The PTR name of a residential address is the
+    # address in digits, and it was published in the XML from t111 onwards.
     v4_xml, v4_error = run_nmap(
-        ["sudo", "nmap", "-Pn", "-sS", "--top-ports", "1000", wan_v4], hashes
+        ["sudo", "nmap", "-n", "-Pn", "-sS", "--top-ports", "1000", wan_v4], hashes
     )
     if v4_error is not None:
         print(f"::warning::IPv4 scan failed: {v4_error}")
@@ -256,14 +382,16 @@ def main() -> int:
             {
                 "target": "wan_ipv4",
                 "family": 4,
-                "target_value_hash": hashes[wan_v4],
-                "nmap_xml": redact(v4_xml or "", hashes),
+                "target_value_hash": target_fingerprint(key, wan_v4),
+                "target_hash_alg": TARGET_HASH_ALG,
+                "target_key_id": target_key_id(key),
+                "nmap_xml": redact(strip_hostnames(v4_xml or ""), hashes),
             }
         )
 
     # --- IPv6: connect scan of the named ports, per monitored GUA --------
     for target in v6_targets:
-        xml, error = run_nmap(["nmap", "-6", "-Pn", "-sT", "-p", V6_PORTS, target], hashes)
+        xml, error = run_nmap(["nmap", "-6", "-n", "-Pn", "-sT", "-p", V6_PORTS, target], hashes)
         if error is not None:
             print(f"::warning::IPv6 scan of one target failed: {error}")
             continue
@@ -271,8 +399,10 @@ def main() -> int:
             {
                 "target": "wan_ipv6",
                 "family": 6,
-                "target_value_hash": hashes[target],
-                "nmap_xml": redact(xml or "", hashes),
+                "target_value_hash": target_fingerprint(key, target),
+                "target_hash_alg": TARGET_HASH_ALG,
+                "target_key_id": target_key_id(key),
+                "nmap_xml": redact(strip_hostnames(xml or ""), hashes),
             }
         )
 
@@ -303,6 +433,16 @@ def main() -> int:
                 "REDACTION FAILED: a WAN address literal survived into the signed body. "
                 "Nothing was published. This is a bug in redact(), not a scan result."
             )
+    # t120. Broader than the literal check above, and it names REASONS only: the
+    # message goes to a public log, so it must not quote what it found.
+    leaks = public_leaks(body, all_targets)
+    if leaks:
+        die(
+            "PUBLICATION REFUSED: the signed body contains "
+            + ", ".join(leaks)
+            + ". Nothing was published; this repository is public and the body would "
+            "name an address. Fix the redaction, do not weaken this check."
+        )
     if len(body.encode("utf-8")) > MAX_BODY_BYTES:
         die(
             f"signed body is {len(body.encode('utf-8'))} bytes, over the {MAX_BODY_BYTES} cap. "
